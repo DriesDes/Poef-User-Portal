@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
-import { fetchPortalData, loginWithCode, logout } from "./lib/api";
+import { supabase } from "./lib/supabase";
 import type { PortalPayload, SessionPersistence } from "./types";
+
+const LOGIN_EXPIRY_KEY = "digitale-poef-portal-expiry";
 
 const persistenceOptions: { value: SessionPersistence; label: string; hint: string }[] = [
   { value: "day", label: "1 dag", hint: "Op gedeelde toestellen." },
@@ -10,6 +12,36 @@ const persistenceOptions: { value: SessionPersistence; label: string; hint: stri
   { value: "forever", label: "Altijd", hint: "Alleen op een privetoestel." }
 ];
 
+const persistenceDurations: Record<Exclude<SessionPersistence, "forever">, number> = {
+  day: 24 * 60 * 60 * 1000,
+  week: 7 * 24 * 60 * 60 * 1000,
+  month: 30 * 24 * 60 * 60 * 1000,
+  year: 365 * 24 * 60 * 60 * 1000
+};
+
+type AppState = "loading" | "anonymous" | "ready" | "error";
+
+type UserRow = {
+  naam: string;
+  tak: string | null;
+  saldo: number | string | null;
+  strippen: number | null;
+  updated_at: string | null;
+};
+
+type LogRow = {
+  id: string;
+  ts: string;
+  type: string;
+  product: string | null;
+  amount: number | string | null;
+  saldo_before: number | string | null;
+  saldo_after: number | string | null;
+  strips_before: number | null;
+  strips_after: number | null;
+  notes: string | null;
+};
+
 function formatDateTime(isoValue: string): string {
   return new Intl.DateTimeFormat("nl-BE", {
     dateStyle: "medium",
@@ -17,7 +49,85 @@ function formatDateTime(isoValue: string): string {
   }).format(new Date(isoValue));
 }
 
-type AppState = "loading" | "anonymous" | "ready" | "error";
+function formatMoney(value: number | string | null | undefined): string | null {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const numeric = typeof value === "string" ? Number(value) : value;
+  if (Number.isNaN(numeric)) {
+    return null;
+  }
+
+  return new Intl.NumberFormat("nl-BE", {
+    style: "currency",
+    currency: "EUR"
+  }).format(numeric);
+}
+
+function buildPortalEmail(code: string): string {
+  const normalized = code.trim().toLowerCase().replace(/[^a-z0-9-]/g, "-");
+  return `${normalized}@portal.digitale-poef.local`;
+}
+
+function setLoginExpiry(persistence: SessionPersistence) {
+  if (persistence === "forever") {
+    window.localStorage.removeItem(LOGIN_EXPIRY_KEY);
+    return;
+  }
+
+  const expiresAt = Date.now() + persistenceDurations[persistence];
+  window.localStorage.setItem(LOGIN_EXPIRY_KEY, String(expiresAt));
+}
+
+async function clearExpiredSession() {
+  const expiry = window.localStorage.getItem(LOGIN_EXPIRY_KEY);
+  if (!expiry) {
+    return;
+  }
+
+  const expiresAt = Number(expiry);
+  if (Number.isNaN(expiresAt) || expiresAt > Date.now()) {
+    return;
+  }
+
+  await supabase.auth.signOut();
+  window.localStorage.removeItem(LOGIN_EXPIRY_KEY);
+}
+
+function mapTransactions(logs: LogRow[]) {
+  return logs.map((log) => {
+    const stripDelta =
+      log.strips_before !== null && log.strips_after !== null
+        ? log.strips_after - log.strips_before
+        : null;
+    const saldoDelta =
+      log.saldo_before !== null && log.saldo_after !== null
+        ? Number(log.saldo_after) - Number(log.saldo_before)
+        : null;
+
+    let amountLabel = formatMoney(log.amount) ?? "Geen bedrag";
+    let description = log.notes?.trim() || "Geen extra omschrijving";
+
+    if (stripDelta !== null && stripDelta !== 0) {
+      amountLabel = `${stripDelta > 0 ? "+" : ""}${stripDelta} strip${Math.abs(stripDelta) === 1 ? "" : "pen"}`;
+    } else if (saldoDelta !== null && saldoDelta !== 0) {
+      amountLabel = `${saldoDelta > 0 ? "+" : ""}${formatMoney(saldoDelta)}`;
+    }
+
+    if (log.product) {
+      description = `${log.product}${log.notes ? ` - ${log.notes}` : ""}`;
+    }
+
+    return {
+      id: log.id,
+      timestamp: log.ts,
+      type: log.type,
+      amountLabel,
+      description
+    };
+  });
+}
 
 export function App() {
   const [state, setState] = useState<AppState>("loading");
@@ -28,26 +138,86 @@ export function App() {
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
-    void loadPortal();
+    void initializePortal();
   }, []);
+
+  async function initializePortal() {
+    setState("loading");
+    setErrorMessage(null);
+
+    try {
+      await clearExpiredSession();
+      const {
+        data: { session }
+      } = await supabase.auth.getSession();
+
+      if (!session) {
+        setPayload(null);
+        setState("anonymous");
+        return;
+      }
+
+      await loadPortal();
+    } catch (error) {
+      setPayload(null);
+      setState("error");
+      setErrorMessage(error instanceof Error ? error.message : "Portal kon niet geladen worden.");
+    }
+  }
 
   async function loadPortal() {
     setState("loading");
     setErrorMessage(null);
 
     try {
-      const nextPayload = await fetchPortalData();
-      setPayload(nextPayload);
-      setState("ready");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Portal kon niet geladen worden.";
-      if (message === "Niet ingelogd." || message === "Sessie verlopen. Meld opnieuw aan.") {
+      const {
+        data: { user },
+        error: userError
+      } = await supabase.auth.getUser();
+
+      if (userError) {
+        throw userError;
+      }
+
+      if (!user) {
         setPayload(null);
         setState("anonymous");
-        setErrorMessage(message === "Niet ingelogd." ? null : message);
         return;
       }
 
+      const { data: profile, error: profileError } = await supabase
+        .from("users")
+        .select("naam,tak,saldo,strippen,updated_at")
+        .single<UserRow>();
+
+      if (profileError) {
+        throw profileError;
+      }
+
+      const { data: logs, error: logsError } = await supabase
+        .from("logs")
+        .select("id,ts,type,product,amount,saldo_before,saldo_after,strips_before,strips_after,notes")
+        .order("ts", { ascending: false })
+        .limit(100)
+        .returns<LogRow[]>();
+
+      if (logsError) {
+        throw logsError;
+      }
+
+      setPayload({
+        profile: {
+          naam: profile.naam,
+          tak: profile.tak,
+          saldo: formatMoney(profile.saldo),
+          strippen: profile.strippen ?? 0,
+          updatedAt: profile.updated_at ?? null
+        },
+        transactions: mapTransactions(logs)
+      });
+      setState("ready");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Portal kon niet geladen worden.";
       setPayload(null);
       setState("error");
       setErrorMessage(message);
@@ -60,12 +230,23 @@ export function App() {
     setErrorMessage(null);
 
     try {
-      await loginWithCode(code, persistence);
+      const normalizedCode = code.trim().toLowerCase();
+      const { error } = await supabase.auth.signInWithPassword({
+        email: buildPortalEmail(normalizedCode),
+        password: normalizedCode
+      });
+
+      if (error) {
+        throw error;
+      }
+
+      setLoginExpiry(persistence);
       setCode("");
       await loadPortal();
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Aanmelden mislukt.");
+      setPayload(null);
       setState("anonymous");
+      setErrorMessage(error instanceof Error ? "Aanmelden mislukt. Controleer je code." : "Aanmelden mislukt.");
     } finally {
       setSubmitting(false);
     }
@@ -76,7 +257,8 @@ export function App() {
     setErrorMessage(null);
 
     try {
-      await logout();
+      await supabase.auth.signOut();
+      window.localStorage.removeItem(LOGIN_EXPIRY_KEY);
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Afmelden mislukt.");
     } finally {
@@ -116,7 +298,7 @@ export function App() {
                 <input
                   type="password"
                   inputMode="text"
-                  autoComplete="one-time-code"
+                  autoComplete="current-password"
                   value={code}
                   onChange={(event) => setCode(event.target.value)}
                   placeholder="Vul je persoonlijke code in"
@@ -153,9 +335,6 @@ export function App() {
 
               {errorMessage && <p className="feedback error">{errorMessage}</p>}
               {state === "loading" && <p className="feedback">Sessie controleren...</p>}
-              {state === "error" && !errorMessage && (
-                <p className="feedback error">Portal is tijdelijk niet beschikbaar.</p>
-              )}
 
               <button className="primary-button" type="submit" disabled={submitting || code.trim().length < 6}>
                 {submitting ? "Bezig..." : "Verder naar mijn portal"}

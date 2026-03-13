@@ -21,3 +21,7 @@ export type PortalPayload = {
 
 export type SessionPersistence = "day" | "week" | "month" | "year" | "forever";
 
+export type PortalAccount = {
+  auth_user_id: string;
+  user_naam: string;
+};

@@ -1,18 +1,18 @@
 # Digitale Poef User Portal
 
-Read-only user portal voor Zeescouts De Boekaniers. Gebruikers zien alleen hun eigen saldo, strippen en transacties via een persoonlijke toegangscode.
+Statische read-only user portal voor Zeescouts De Boekaniers, bedoeld voor deployment op GitHub Pages.
 
 ## Architectuur
 
 - `src/`: React frontend in de Digitale Poef-stijl.
-- `server/`: Express API voor veilige code-login, sessiecookies en server-side Supabase queries.
-- `supabase/migrations/`: SQL voor portal toegangscodes en sessies.
+- `supabase/migrations/20260313_github_pages_portal_auth.sql`: RLS en mapping voor frontend-only toegang via Supabase Auth.
+- `scripts/provision-portal-auth.mjs`: lokaal adminscript dat voor alle bestaande users automatisch portal-auth accounts en inlogcodes aanmaakt.
 
-De frontend leest geen ruwe Supabase tabellen rechtstreeks. Alle gevoelige data loopt via de server met `SUPABASE_SERVICE_ROLE_KEY`, waarna de server alleen de data van de ingelogde gebruiker terugstuurt.
+Deze variant gebruikt geen eigen backend. De portal draait volledig statisch en leest rechtstreeks uit Supabase met de publieke anon key. Toegang wordt afgedwongen met Supabase Auth en RLS.
 
-## Vereiste environment variables
+## Benodigde env vars
 
-Kopieer `.env.example` naar `.env.local` of `.env` en vul minstens dit in:
+Voor lokaal werken in `.env.local`:
 
 ```env
 VITE_APP_TITLE=Digitale Poef
@@ -20,54 +20,70 @@ VITE_SUPABASE_URL=https://cyderjajlglaebxqqasd.supabase.co
 VITE_SUPABASE_ANON_KEY=...
 SUPABASE_URL=https://cyderjajlglaebxqqasd.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=...
-SESSION_SECRET=een-lange-random-string-van-minstens-32-karakters
 ```
+
+Voor GitHub Pages zet je in GitHub repo settings onder `Settings` > `Secrets and variables` > `Actions` deze repository variables:
+
+- `VITE_APP_TITLE`
+- `VITE_SUPABASE_URL`
+- `VITE_SUPABASE_ANON_KEY`
+
+## Eenmalige Supabase setup
+
+1. Voer [20260313_github_pages_portal_auth.sql](/C:/Users/Dries/Documents/VSCode/Scouts/Nieuwe%20map/Poef-User-Portal/supabase/migrations/20260313_github_pages_portal_auth.sql) uit in Supabase SQL Editor.
+2. Controleer dat `users` en `logs` nu RLS hebben ingeschakeld.
+3. Run lokaal:
+
+```bash
+npm install
+npm run provision:portal-auth
+```
+
+Dat script doet dit automatisch:
+
+- leest alle users uit `public.users`
+- maakt voor elke user een Supabase Auth account aan of werkt het bij
+- maakt of update de mapping in `public.portal_accounts`
+- schrijft een lokaal CSV-bestand `portal_login_codes_YYYY-MM-DD.csv` met alle plain-text login codes
 
 Belangrijk:
 
-- `SUPABASE_SERVICE_ROLE_KEY` hoort alleen server-side.
-- Zet secrets nooit in git.
-- De portal kan pas echt inloggen zodra `portal_access_codes` en `portal_sessions` zijn aangemaakt.
+- commit dat gegenereerde CSV-bestand niet
+- de login code is de volledige gebruikerscode uit dat CSV-bestand
+- als je codes opnieuw wilt genereren, run je hetzelfde script opnieuw
 
-## Opstarten
+## Loginmodel
+
+De gebruiker logt in met enkel zijn persoonlijke code.
+
+Onderliggend gebruikt de frontend:
+
+- een deterministisch auth e-mailadres op basis van die code
+- dezelfde code als Supabase password
+
+Dat is nodig om GitHub Pages te kunnen gebruiken zonder eigen backend.
+
+## Lokaal draaien
 
 ```bash
 npm install
 npm run dev
 ```
 
-Frontend:
+## GitHub Pages deploy
 
-- `http://localhost:5173`
+1. Push naar `main`.
+2. Zorg dat de GitHub Actions repo variables ingevuld zijn.
+3. In GitHub:
+   `Settings` > `Pages` > `Source` = `GitHub Actions`
+4. De workflow in [.github/workflows/deploy-pages.yml](/C:/Users/Dries/Documents/VSCode/Scouts/Nieuwe%20map/Poef-User-Portal/.github/workflows/deploy-pages.yml) bouwt en publiceert automatisch de `dist` map.
 
-API:
+## Codes opnieuw genereren
 
-- `http://localhost:8787`
-
-## Supabase setup
-
-Voer de SQL uit uit [supabase/migrations/20260313_portal_auth.sql](/C:/Users/Dries/Documents/VSCode/Scouts/Nieuwe map/Poef-User-Portal/supabase/migrations/20260313_portal_auth.sql).
-
-Daarna moet je voor elke gebruiker minstens een gehashte toegangscode invoeren.
-
-Hash genereren:
+Als je voor iedereen nieuwe codes wilt uitdelen:
 
 ```bash
-node scripts/generate-access-code.mjs mijn-persoonlijke-code
+npm run provision:portal-auth
 ```
 
-En dan bijvoorbeeld:
-
-```sql
-insert into public.portal_access_codes (user_naam, code_hash, code_label)
-values ('Cavia', '<gegenereerde-hash>', 'persoonlijke code');
-```
-
-## Aanbevolen database hardening
-
-De screenshots tonen dat `users` en `logs` nu niet afgeschermd zijn. Voor productie raad ik dit aanvullend aan:
-
-- RLS inschakelen op `users` en `logs`
-- client-side directe toegang tot gevoelige tabellen vermijden
-- `users.pin` niet hergebruiken als portalcode
-- oude portal sessies periodiek opruimen
+Dat script reset de login voor alle users naar nieuwe codes en overschrijft hun auth credentials.
